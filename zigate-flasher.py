@@ -11,7 +11,7 @@ _responses = {}
 port = sys.argv[1]
 
 ZIGATE_CHIP_ID = 0x10408686
-ZIGATE_BINARY_VERSION = 0x07030008
+ZIGATE_BINARY_VERSION = bytes.fromhex('07030008')
 
 class Command:
 
@@ -83,7 +83,7 @@ def prepare(type_, data):
             data), 0)
 
     message = struct.pack('!BB%dsB' % len(data), length, type_, data, checksum)
-    print('Prepared command 0x%s' % message.hex())
+    #print('Prepared command 0x%s' % message.hex())
     return message
 
 
@@ -104,6 +104,15 @@ def _unpack_raw_message(length, decoded):
             struct.unpack('!B%dsB' % (length - 2), decoded)
     return _responses.get(type_, Response)(type_, data, chksum)
 
+@Command(0x07)
+def req_flash_erase():
+    pass
+
+@Command(0x09, raw=True)
+def req_flash_write(addr, data):
+    msg = struct.pack('<L%ds' % len(data), addr, data)
+    return msg
+
 @Command(0x0b, '<LH')
 def req_flash_read(addr, length):
     return (addr, length)
@@ -119,10 +128,10 @@ def req_flash_id():
 
 @Command(0x27, '!B')
 def req_change_baudrate(rate):
-    print(serial.Serial.BAUDRATES)
+    #print(serial.Serial.BAUDRATES)
     clockspeed = 1000000
     divisor = round(clockspeed / rate)
-    print(divisor)
+    #print(divisor)
     return divisor
 
 
@@ -209,13 +218,13 @@ else:
 
 ser.write(req_ram_read(0x01001570, 8))
 res = read_response(ser)
-print (res.ok)
-print (res.data)
+#print (res.ok)
+#print (res.data)
 if res.data == bytes.fromhex('ffffffffffffffff'):
 
     ser.write(req_ram_read(0x01001580, 8))
     res = read_response(ser)
-print (res.ok)
+#print (res.ok)
 print('Found MAC-address: %s' % ':'.join(''.join(x) for x in zip(*[iter(res.data.hex())]*2)))
 
 ser.write(req_select_flash_type(8))
@@ -227,8 +236,9 @@ if not res or not res.ok:
 flash_start = cur = 0x00000000
 flash_end = 0x00040000
 
-with open('/tmp/cur_flash.data', 'wb') as fd:
-    fd.write(struct.pack('>L', ZIGATE_BINARY_VERSION))
+print('reading old flash to /tmp/old_flash.bin')
+with open('/tmp/old_flash.bin', 'wb') as fd:
+    fd.write(ZIGATE_BINARY_VERSION)
     read_bytes = 128
     while cur < flash_end:
         if cur + read_bytes > flash_end:
@@ -237,28 +247,32 @@ with open('/tmp/cur_flash.data', 'wb') as fd:
         res = read_response(ser)
         if cur == 0:
             (flash_end,) = struct.unpack('>L', res.data[0x20:0x24])
-        print (read_bytes)
-        print (res.ok)
-        print(res)
         fd.write(res.data)
         cur += read_bytes
 
+print('writing new flash from /tmp/new_flash.bin')
+with open('/tmp/new_flash.bin', 'rb') as fd:
+    ser.write(req_flash_erase())
+    res = read_response(ser)
+    if not res or not res.ok:
+        print('Erasing flash failed')
+        raise SystemExit(1)
 
+    flash_start = cur = 0x00000000
+    flash_end = 0x00040000
 
-#ser.write(req_ram_read(0x01001580, 8))
-#res = read_response(ser)
-#print (res.ok)
-#print(res)
-
-#ser.dtr = 0
-#time.sleep(.01)
-#ser.dtr = 1;
-
-#ser.write(bytes.fromhex('023230'))     # write a string
-#length = ser.read()
-#length = int.from_bytes(length, 'big')
-#answer = ser.read(length)
-#print('0x%s' % answer.hex())
-#ser.close()             # close port
-#
-#prepare(0x27, bytes.fromhex('09'))
+    bin_ver = fd.read(4)
+    if bin_ver != ZIGATE_BINARY_VERSION:
+        print('Not a valid image for Zigate')
+        raise SystemExit(1)
+    read_bytes = 128
+    while cur < flash_end:
+        data = fd.read(read_bytes)
+        if not data:
+            break
+        ser.write(req_flash_write(cur, data))
+        res = read_response(ser)
+        if not res.ok:
+            print('writing failed at 0x%08x, status: 0x%x, data: %s' % (cur, res.status, data.hex()))
+            raise SystemExit(1)
+        cur += read_bytes
