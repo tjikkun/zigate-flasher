@@ -1,17 +1,25 @@
 #!/usr/bin/python3
-import time
-import serial
+import argparse
 import atexit
-import sys
-import struct
 import functools
 import itertools
+import logging
+import struct
+import sys
+import time
 from operator import xor
+
+import serial
+from serial.tools.list_ports import comports
+
+logger = logging.getLogger(__name__)
 _responses = {}
-port = sys.argv[1]
 
 ZIGATE_CHIP_ID = 0x10408686
 ZIGATE_BINARY_VERSION = bytes.fromhex('07030008')
+ZIGATE_FLASH_START = 0x00000000
+ZIGATE_FLASH_END = 0x00040000
+
 
 class Command:
 
@@ -178,101 +186,138 @@ class GetChipIDResponse(Response):
         return 'GetChipIDResponse (ok=%s, chip_id=0x%04x)' % (self.ok, self.chip_id)
 
 
+def change_baudrate(ser, baudrate):
+    ser.write(req_change_baudrate(baudrate))
 
-ser = serial.Serial(port,  38400, timeout=5)  # open serial port
-
-atexit.register(ser.write, req_change_baudrate(38400))
-
-ser.write(req_change_baudrate(115200))
-
-res = read_response(ser)
-if not res or not res.ok:
-    print('Change baudrate failed')
-    raise SystemExit(1)
-
-ser.baudrate = 115200
-
-ser.write(req_chip_id())
-
-res = read_response(ser)
-if not res or not res.ok:
-    print('Getting Chip ID failed')
-    raise SystemExit(1)
-
-if res.chip_id != ZIGATE_CHIP_ID:
-    print('This is not a supported chip, patches welcome')
-    raise SystemExit(1)
-
-ser.write(req_flash_id())
-res = read_response(ser)
-
-if not res or not res.ok:
-    print('Getting Flash ID failed')
-    raise SystemExit(1)
-
-if res.manufacturer_id != 0xcc or res.device_id != 0xee:
-    print('Unsupported Flash ID, patches welcome')
-    raise SystemExit(1)
-else:
-    flash_type = 8
-
-ser.write(req_ram_read(0x01001570, 8))
-res = read_response(ser)
-#print (res.ok)
-#print (res.data)
-if res.data == bytes.fromhex('ffffffffffffffff'):
-
-    ser.write(req_ram_read(0x01001580, 8))
-    res = read_response(ser)
-#print (res.ok)
-print('Found MAC-address: %s' % ':'.join(''.join(x) for x in zip(*[iter(res.data.hex())]*2)))
-
-ser.write(req_select_flash_type(8))
-res = read_response(ser)
-if not res or not res.ok:
-    print('Selecting flash type failed')
-    raise SystemExit(1)
-
-flash_start = cur = 0x00000000
-flash_end = 0x00040000
-
-print('reading old flash to /tmp/old_flash.bin')
-with open('/tmp/old_flash.bin', 'wb') as fd:
-    fd.write(ZIGATE_BINARY_VERSION)
-    read_bytes = 128
-    while cur < flash_end:
-        if cur + read_bytes > flash_end:
-            read_bytes = flash_end - cur
-        ser.write(req_flash_read(cur, read_bytes))
-        res = read_response(ser)
-        if cur == 0:
-            (flash_end,) = struct.unpack('>L', res.data[0x20:0x24])
-        fd.write(res.data)
-        cur += read_bytes
-
-print('writing new flash from /tmp/new_flash.bin')
-with open('/tmp/new_flash.bin', 'rb') as fd:
-    ser.write(req_flash_erase())
     res = read_response(ser)
     if not res or not res.ok:
-        print('Erasing flash failed')
+        logger.exception('Change baudrate failed')
         raise SystemExit(1)
 
-    flash_start = cur = 0x00000000
-    flash_end = 0x00040000
+    ser.baudrate = baudrate
 
-    bin_ver = fd.read(4)
-    if bin_ver != ZIGATE_BINARY_VERSION:
-        print('Not a valid image for Zigate')
+
+def check_chip_id(ser):
+    ser.write(req_chip_id())
+    res = read_response(ser)
+    if not res or not res.ok:
+        logger.exception('Getting Chip ID failed')
         raise SystemExit(1)
-    read_bytes = 128
-    while cur < flash_end:
-        data = fd.read(read_bytes)
-        if not data:
-            break
-        ser.write(req_flash_write(cur, data))
+    if res.chip_id != ZIGATE_CHIP_ID:
+        logger.exception('This is not a supported chip, patches welcome')
+        raise SystemExit(1)
+
+
+def get_flash_type(ser):
+    ser.write(req_flash_id())
+    res = read_response(ser)
+
+    if not res or not res.ok:
+        print('Getting Flash ID failed')
+        raise SystemExit(1)
+
+    if res.manufacturer_id != 0xcc or res.device_id != 0xee:
+        print('Unsupported Flash ID, patches welcome')
+        raise SystemExit(1)
+    else:
+        return 8
+
+
+def get_mac(ser):
+    ser.write(req_ram_read(0x01001570, 8))
+    res = read_response(ser)
+    if res.data == bytes.fromhex('ffffffffffffffff'):
+        ser.write(req_ram_read(0x01001580, 8))
         res = read_response(ser)
-        if not res.ok:
-            print('writing failed at 0x%08x, status: 0x%x, data: %s' % (cur, res.status, data.hex()))
+    return ':'.join(''.join(x) for x in zip(*[iter(res.data.hex())]*2))
+
+
+def select_flash(ser, flash_type):
+    ser.write(req_select_flash_type(flash_type))
+    res = read_response(ser)
+    if not res or not res.ok:
+        print('Selecting flash type failed')
+        raise SystemExit(1)
+
+
+def write_flash_to_file(ser, filename):
+    flash_start = cur = ZIGATE_FLASH_START
+    flash_end = ZIGATE_FLASH_END
+
+    print('reading old flash to %s' % filename)
+    with open(filename, 'wb') as fd:
+        fd.write(ZIGATE_BINARY_VERSION)
+        read_bytes = 128
+        while cur < flash_end:
+            if cur + read_bytes > flash_end:
+                read_bytes = flash_end - cur
+            ser.write(req_flash_read(cur, read_bytes))
+            res = read_response(ser)
+            if cur == 0:
+                (flash_end,) = struct.unpack('>L', res.data[0x20:0x24])
+            fd.write(res.data)
+            cur += read_bytes
+
+
+def write_file_to_flash(ser, filename):
+    print('writing new flash from %s' % filename)
+    with open(filename, 'rb') as fd:
+        ser.write(req_flash_erase())
+        res = read_response(ser)
+        if not res or not res.ok:
+            print('Erasing flash failed')
             raise SystemExit(1)
-        cur += read_bytes
+
+        flash_start = cur = ZIGATE_FLASH_START
+        flash_end = ZIGATE_FLASH_END
+
+        bin_ver = fd.read(4)
+        if bin_ver != ZIGATE_BINARY_VERSION:
+            print('Not a valid image for Zigate')
+            raise SystemExit(1)
+        read_bytes = 128
+        while cur < flash_end:
+            data = fd.read(read_bytes)
+            if not data:
+                break
+            ser.write(req_flash_write(cur, data))
+            res = read_response(ser)
+            if not res.ok:
+                print('writing failed at 0x%08x, status: 0x%x, data: %s' % (cur, res.status, data.hex()))
+                raise SystemExit(1)
+            cur += read_bytes
+
+
+def main():
+    ports_available = [port for (port, _, _) in sorted(comports())]
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-p', '--serialport', choices=ports_available,
+            help='Serial port, e.g. /dev/ttyUSB0', required=True)
+    parser.add_argument('-w', '--write', help='Firmware bin to flash onto the chip')
+    parser.add_argument('-s', '--save', help='File to save the currently loaded firmware to')
+    args = parser.parse_args()
+    try:
+        ser = serial.Serial(args.serialport,  38400, timeout=5)
+    except serial.SerialException:
+        logger.exception("Could not open serial device %s", args.serialport)
+        raise SystemExit(1)
+
+    atexit.register(change_baudrate, ser, 38400)
+
+    change_baudrate(ser, 115200)
+    check_chip_id(ser)
+    flash_type = get_flash_type(ser)
+    mac_address = get_mac(ser)
+    print('Found MAC-address: %s' % mac_address)
+    if args.write or args.save:
+        select_flash(ser, flash_type)
+
+    if args.save:
+        write_flash_to_file(ser, args.save)
+
+    if args.write:
+        write_file_to_flash(ser, args.write)
+
+
+if __name__ == "__main__":
+    main()
