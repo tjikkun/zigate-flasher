@@ -9,8 +9,14 @@ import sys
 import time
 from operator import xor
 
+
 import serial
 from serial.tools.list_ports import comports
+
+import usb
+
+
+import RPi.GPIO as GPIO
 
 logger = logging.getLogger(__name__)
 _responses = {}
@@ -20,7 +26,10 @@ ZIGATE_BINARY_VERSION = bytes.fromhex('07030008')
 ZIGATE_FLASH_START = 0x00000000
 ZIGATE_FLASH_END = 0x00040000
 
-
+# For DIN-ZiGate
+# cf. https://github.com/fairecasoimeme/ZiGate-DIN/blob/master/tools/flash_ZiGate-DIN.py
+BITMODE_CBUS = 0x20
+SIO_SET_BITMODE_REQUEST = 0x0b
 class Command:
 
     def __init__(self, type_, fmt=None, raw=False):
@@ -308,17 +317,99 @@ def erase_EEPROM(ser, pdm_only=False):
         print('Erasing EEPROM failed')
         raise SystemExit(1)
 
+def ftdi_set_bitmode(dev, bitmask):
+    bmRequestType = usb.util.build_request_type(usb.util.CTRL_OUT,
+                                                usb.util.CTRL_TYPE_VENDOR,
+                                                usb.util.CTRL_RECIPIENT_DEVICE)
+
+    wValue = bitmask | (BITMODE_CBUS << BITMODE_CBUS)
+    dev.ctrl_transfer(bmRequestType, SIO_SET_BITMODE_REQUEST, wValue)
+
+def piZiGate_flash():
+    # Cf: https://github.com/fairecasoimeme/ZiGate/blob/master/Tools/PiZiGate/Test/main.c
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setwarnings(False)
+    channel_lst = [17, 27]
+    GPIO.setup(channel_lst, GPIO.OUT)
+
+    GPIO.output( 27,0)
+    time.sleep(0.5)
+    GPIO.output( 17,0)
+    time.sleep(0.5)
+    GPIO.output( 17,1)
+    time.sleep(0.5)
+
+
+def piZiGate_run():
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setwarnings(False)
+    channel_lst = [17, 27]
+    GPIO.setup(channel_lst, GPIO.OUT)
+
+    # Mode Run
+    GPIO.output(27, 1)
+    time.sleep(0.5)
+    GPIO.output(17, 0)
+    time.sleep(0.5)
+    GPIO.output(17, 1)
+    time.sleep(0.5)
+
+
+
+def piZiGate_status( mode ):
+
+    ei0 = GPIO.input(17)
+    ei2 = GPIO.input(27)
+    if mode == 'flash':
+        if not ei2:
+            print(" + GPIO(FLASH) OK")
+        else:
+            print(" + GPIO(FLASH) KO")
+    elif mode == 'run':
+        if ei0:
+            print(" + GPIO(RUN) OK") 
+        else:
+            print(" + GPIO(RUN) KO")
+
 
 def main():
-    ports_available = [port for (port, _, _) in sorted(comports())]
+    ports_available = [port for (port, _, _) in sorted(comports(include_links=True))]
     parser = argparse.ArgumentParser()
+    parser.add_argument('--din', help='Firmware flash for DIN-ZiGate', action='store_true', default= False)
+    parser.add_argument('--pi', help='Firmware flash for Pi-ZiGate', action='store_true', default= False)
     parser.add_argument('-p', '--serialport', choices=ports_available,
             help='Serial port, e.g. /dev/ttyUSB0', required=True)
     parser.add_argument('-w', '--write', help='Firmware bin to flash onto the chip')
     parser.add_argument('-s', '--save', help='File to save the currently loaded firmware to')
     parser.add_argument('-e', '--erase', help='Erase EEPROM', action='store_true')
     parser.add_argument('--pdm-only', help='Erase PDM only, use it with --erase', action='store_true')
+
+
     args = parser.parse_args()
+
+
+    if args.din:
+        # Put DIN-ZiGate in flash mode
+        # From @faircasoimeme tool
+        dev_din = usb.core.find(custom_match = \
+            lambda d: \
+                d.idVendor==0x0403 and
+                d.idProduct==0x6001 )
+        ftdi_set_bitmode(dev_din, 0x00)
+        time.sleep(1.0)
+        # Set CBUS2/3 high...
+        ftdi_set_bitmode(dev_din, 0xCC)
+        time.sleep(1.0)
+        # Set CBUS2/3 low...
+        ftdi_set_bitmode(dev_din, 0xC0)
+        time.sleep(1.0)
+        ftdi_set_bitmode(dev_din, 0xC4)
+        time.sleep(1.0)
+
+    elif args.pi:
+        piZiGate_flash()
+        piZiGate_status( 'flash')
+
     try:
         ser = serial.Serial(args.serialport,  38400, timeout=5)
     except serial.SerialException:
@@ -343,6 +434,17 @@ def main():
 
     if args.erase:
         erase_EEPROM(ser, args.pdm_only)
+
+    if args.din:
+        # Put DIN-ZiGate in flash mode
+        # From @faircasoimeme tool
+        ftdi_set_bitmode(dev_din, 0xC8)
+        time.sleep(1.0)
+        ftdi_set_bitmode(dev_din, 0xCC)
+
+    elif args.pi:
+        piZiGate_run()
+        piZiGate_status( 'run')
 
 
 if __name__ == "__main__":
