@@ -5,7 +5,7 @@ Python tool to flash your Zigate (Jennic JN5168)
 - Python 3.5 or higher
 - pyserial
 - pyusb
-- RPi.GPIO
+- RPi.GPIO (runs only on Raspberry Pi)
 
 ## Usage
 ```
